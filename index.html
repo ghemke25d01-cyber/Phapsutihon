@@ -3559,21 +3559,29 @@ window.PSTH_SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_HE-QDhvhsXjxZ5UbAH0iIQ_KK
 </script>
 
 <script id="psth-auto-save-js">
-/* V101 — automatic character save to Supabase.
+/* V105 — automatic character save to Supabase.
    Persistent fields: name, level, total EXP, HP/Max HP, MP/Max MP. */
 (() => {
   const API=String(window.PSTH_SUPABASE_URL||'').replace(/\/$/,'');
   const KEY=String(window.PSTH_SUPABASE_PUBLISHABLE_KEY||'');
   let saveTimer=0, saving=false, saveQueued=false;
-  function characterId(){return window.psthCharacterId||localStorage.getItem('psth_character_id')||'';}
+  function characterId(){
+    // V105: never use the cached character id before the current page has
+    // successfully loaded/authenticated the character. This prevents a fresh
+    // page (whose in-memory level starts at 0) from overwriting a saved Lv.1+.
+    if(window.psthCharacterLoaded!==true) return '';
+    return window.psthCharacterId||localStorage.getItem('psth_character_id')||'';
+  }
   function snapshot(){
     const id=characterId();
-    if(!id||!API||!KEY||KEY==='PASTE_YOUR_PUBLISHABLE_KEY_HERE')return null;
+    if(window.psthCharacterLoaded!==true||!id||!API||!KEY||KEY==='PASTE_YOUR_PUBLISHABLE_KEY_HERE')return null;
     const maxHp=Math.max(1,Math.round(Number(window.playerMaxHp)||100));
     const maxMp=Math.max(1,Math.round(Number(window.playerMaxMp)||100));
     const hp=Math.max(0,Math.min(maxHp,Math.round(Number(window.playerHp)||0)));
     const mp=Math.max(0,Math.min(maxMp,Math.round(Number(window.playerMp)||0)));
-    const totalExp=Math.max(0,Math.floor(Number(window.playerExpTotal)||Number(window.PSTH_EXP_STATE?.total)||0));
+    const rawClientExp=Number(window.playerExpTotal);
+    const rawStateExp=Number(window.PSTH_EXP_STATE?.total);
+    const totalExp=Math.max(0,Math.floor(Number.isFinite(rawClientExp)?rawClientExp:(Number.isFinite(rawStateExp)?rawStateExp:0)));
     const level=Math.max(0,Math.floor(Number(window.playerLevel)||0));
     const name=String(window.playerName||'PHÁP SƯ').trim()||'PHÁP SƯ';
     return {p_character_id:id,p_character_name:name,p_level:level,p_total_exp:totalExp,p_hp:hp,p_max_hp:maxHp,p_mp:mp,p_max_mp:maxMp};
@@ -3592,7 +3600,7 @@ window.PSTH_SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_HE-QDhvhsXjxZ5UbAH0iIQ_KK
       if(!r.ok){const t=await r.text();throw new Error(t||('HTTP '+r.status));}
       window.psthLastSaveAt=Date.now();window.psthLastSaveReason=reason;
       return true;
-    }catch(e){console.warn('[PSTH V101 save]',e);return false;}
+    }catch(e){console.warn('[PSTH V105 save]',e);return false;}
     finally{saving=false;if(saveQueued)scheduleSave('queued',250);}
   }
   function scheduleSave(reason='auto',delay=900){clearTimeout(saveTimer);saveTimer=setTimeout(()=>saveCharacter(reason),delay);}
@@ -3620,6 +3628,7 @@ window.PSTH_SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_HE-QDhvhsXjxZ5UbAH0iIQ_KK
   const API=String(window.PSTH_SUPABASE_URL||'').replace(/\/$/,'');
   const KEY=String(window.PSTH_SUPABASE_PUBLISHABLE_KEY||'');
   let mode='login';
+  window.psthCharacterLoaded=false;
 
   async function rpc(name, body){
     const r=await fetch(API+'/rest/v1/rpc/'+name,{
@@ -3645,25 +3654,66 @@ window.PSTH_SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_HE-QDhvhsXjxZ5UbAH0iIQ_KK
     if(!Array.isArray(data)||!data.length) return null;
     const c=data[0];
     window.psthAccountId=accountId;
-    window.psthCharacterId=c.id;
+    window.psthCharacterId=c.id || c.p_character_id || c.character_id;
     window.psthCharacterData=c;
-    window.playerName=c.character_name||'PHÁP SƯ';
-    // V102: restore the canonical EXP state BEFORE the HUD/game systems run.
-    // Level is derived from total EXP so the saved progression cannot be overwritten by the initial Lv.0 state.
-    window.playerExpTotal=Math.max(0,Math.floor(Number(c.total_exp)||0));
-    window.PSTH_EXP_STATE={total:window.playerExpTotal,level:0,percent:0};
-    if(typeof window.psthSyncLevelFromExp==='function'){
-      window.psthSyncLevelFromExp();
+
+    // V105: the RPC may expose returned fields with either the table names
+    // (total_exp/level/...) or the function parameter names (p_total_exp/p_level/...).
+    // Read both forms and NEVER fall back to zero when a valid saved value exists.
+    const pick=(...keys)=>{
+      for(const k of keys){
+        if(Object.prototype.hasOwnProperty.call(c,k) && c[k]!==null && c[k]!==undefined && c[k]!=='') return c[k];
+      }
+      return undefined;
+    };
+    const rawName=pick('character_name','p_character_name','characterName','p_characterName');
+    const rawTotalExp=pick('total_exp','p_total_exp','totalExp','p_totalExp');
+    const rawLevel=pick('level','p_level','character_level','p_character_level');
+    const rawHp=pick('hp','p_hp','current_hp','currentHp');
+    const rawMaxHp=pick('max_hp','p_max_hp','maxHp');
+    const rawMp=pick('mp','p_mp','current_mp','currentMp');
+    const rawMaxMp=pick('max_mp','p_max_mp','maxMp');
+
+    window.playerName=String(rawName ?? 'PHÁP SƯ').trim()||'PHÁP SƯ';
+
+    const parsedTotalExp=Number(rawTotalExp);
+    const parsedLevel=Number(rawLevel);
+    const hasSavedExp=Number.isFinite(parsedTotalExp);
+    const hasSavedLevel=Number.isFinite(parsedLevel);
+
+    // Restore the canonical EXP state first. If total_exp is present, level is
+    // derived from it. If the RPC did not return total_exp, use the saved level
+    // as a compatibility fallback rather than silently replacing progress with 0.
+    if(hasSavedExp){
+      window.playerExpTotal=Math.max(0,Math.min(53034,Math.floor(parsedTotalExp)));
+      window.PSTH_EXP_STATE={total:window.playerExpTotal,level:0,percent:0};
+      if(typeof window.psthSyncLevelFromExp==='function') window.psthSyncLevelFromExp();
+      else {
+        window.playerLevel=hasSavedLevel?Math.max(0,Math.floor(parsedLevel)):0;
+        window.playerExp=0;
+      }
+    }else if(hasSavedLevel){
+      // Compatibility path: preserve the saved level instead of overwriting it.
+      window.playerLevel=Math.max(0,Math.floor(parsedLevel));
+      window.playerExpTotal=window.PSTH_EXP_TOTAL?.[window.playerLevel] ?? 0;
+      const cur=window.PSTH_EXP_TOTAL?.[window.playerLevel] ?? 0;
+      const next=window.PSTH_EXP_TOTAL?.[Math.min(30,window.playerLevel+1)] ?? cur;
+      window.PSTH_EXP_STATE={total:window.playerExpTotal,level:window.playerLevel,percent:window.playerLevel>=30?100:0};
+      window.playerExp=window.PSTH_EXP_STATE.percent;
     }else{
-      window.playerLevel=Math.max(0,Math.floor(Number(c.level)||0));
-      window.playerExp=window.playerExpTotal;
+      // No usable progression was returned. Do not schedule a save from this path.
+      console.warn('[PSTH V105 load] Character progression fields missing:',c);
+      window.playerExpTotal=0; window.playerLevel=0; window.playerExp=0;
+      window.PSTH_EXP_STATE={total:0,level:0,percent:0};
     }
-    // Keep the database Level as a fallback only if total EXP is unavailable.
-    if(!Number.isFinite(Number(c.total_exp))) window.playerLevel=Math.max(0,Math.floor(Number(c.level)||0));
-    window.playerHp=Number(c.hp)||0;
-    window.playerMaxHp=Number(c.max_hp)||Number(c.hp)||1;
-    window.playerMp=Number(c.mp)||0;
-    window.playerMaxMp=Number(c.max_mp)||Number(c.mp)||1;
+
+    const nHp=Number(rawHp), nMaxHp=Number(rawMaxHp), nMp=Number(rawMp), nMaxMp=Number(rawMaxMp);
+    window.playerHp=Number.isFinite(nHp)?Math.max(0,nHp):100;
+    window.playerMaxHp=Number.isFinite(nMaxHp)?Math.max(1,nMaxHp):Math.max(1,window.playerHp||100);
+    window.playerMp=Number.isFinite(nMp)?Math.max(0,nMp):100;
+    window.playerMaxMp=Number.isFinite(nMaxMp)?Math.max(1,nMaxMp):Math.max(1,window.playerMp||100);
+    // V105: only now may the save bridge persist this character.
+    window.psthCharacterLoaded=true;
     return c;
   }
 
@@ -3711,7 +3761,9 @@ window.PSTH_SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_HE-QDhvhsXjxZ5UbAH0iIQ_KK
         // V102: force all HUD/panels to consume the restored canonical state immediately.
         try{window.psthRefreshExpHUD&&window.psthRefreshExpHUD();}catch(_){ }
         try{document.dispatchEvent(new CustomEvent('psth-character-loaded',{detail:character}));}catch(_){ }
-        if(typeof window.psthScheduleCharacterSave==='function')window.psthScheduleCharacterSave('login',300);
+        // V105: do NOT save immediately on login. The page starts with Lv.0 in memory;
+        // saving here can race with other initialization. Saving begins only after
+        // the character is fully loaded and actual game changes occur.
         overlay.style.display='none';
         if(typeof window.psthRefreshSkillSystem==='function')window.psthRefreshSkillSystem();
       }else{
